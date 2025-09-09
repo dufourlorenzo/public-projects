@@ -1,0 +1,569 @@
+---
+title: "Predictive Analysis of Hikes"
+subtitle: "BDAI Lab Project 2025"
+author: "Lorenzo Dufour, 2133104"
+date: "March 27, 2025"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The selected dataset is a collection of hikes from [hikr.org](https://www.hikr.org), a platform where users can post reports about their hikes, scraped in Spring 2018 by "[Rocco](https://www.kaggle.com/roccoli)" and made available on [Kaggle](https://www.kaggle.com/datasets/roccoli/gpx-hike-tracks). The dataset contains 12,141 observations and 17 variables.
+
+In this analysis, we will attempt to perform a predictive analysis of the hikes' duration based on the other variables in the dataset, and a classification analysis of the hikes' difficulty.
+
+We will also perform a clustering analysis of the hikes' season.
+
+## Variables description
+
+```{r, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+tabl <- "
+| Variable name | Label                                                                        |
+|---------------|------------------------------------------------------------------------------|
+| X_id          | Unique identifier                                                            |
+| length_3d     | Hike length in meters considering elevation changes                          |
+| user          | Username of the hiker who recorded the hike                                  |
+| start_time    | DateTime indicating when the hike started                                    |
+| max_elevation | Maximum altitude reached during the hike                                     |
+| bounds        | Geographical coordinates defining the boundary of the hike region            |
+| uphill        | Total elevation gained during the hike                                       |
+| moving_time   | Duration of the hike in seconds, excluding breaks                            |
+| end_time      | DateTime indicating when the hike ended                                      |
+| max_speed     | Maximum speed achieved during the hike                                       |
+| gpx           | GPS Exchange Format file containing the hike's track, waypoints, and routes  |
+| difficulty    | Hike difficulty rated on the SAC scale, from easiest T1 to most difficult T6 |
+| min_elevation | Minimum elevation reached during the hike                                    |
+| url           | URL to the original post on hikr.org                                         |
+| downhill      | Total elevation lost during the hike                                         |
+| name          | Hike title, given by the user                                                |
+| length_2d     | Hike length in meters without considering elevation changes                  |
+"
+cat(tabl)
+```
+
+## Data preparation
+
+### Import and formatting
+
+```{r, include=FALSE}
+library(tidyverse)
+
+hikes_gross <- RKaggle::get_dataset("roccoli/gpx-hike-tracks") %>% tibble()
+```
+
+Our first step is to validate that all variables are in the correct, most adapted format. We will use the `glimpse` function to get a summary of the dataset.
+
+```{r, echo=FALSE}
+glimpse(hikes_gross)
+```
+
+Most variables are in the correct format, except for the `start_time` and `end_time` variables, which are in character format. The `difficulty` variable is also in character format, an ordered factor could be more appropriate if its unique values are consistent.
+
+The `start_time` and `end_time` variables are in the format "YYYY-MM-DD HH:MM:SS". We will thus use the `lubridate` package to convert them to datetime format.
+
+```{r, echo=FALSE}
+unique(hikes_gross$difficulty)
+```
+
+Using the base R `unique()` function, we see that the `difficulty` variable has 13 clean categories, fitted on the [SAC alpine hiking scale](https://www.sac-cas.ch/en/ausbildung-und-sicherheit/tourenplanung/grading-systems/). We can order them from easiest to most difficult using an ordered factor. We will also remove the hiking levels descriptions in the strings to make them more readable.
+
+```{r, include=FALSE}
+hike_difficulty_levels = c("T1", "T2", "T3", "T3+", "T4-", "T4", "T4+", "T5-", "T5", "T5+", "T6-", "T6", "T6+")
+
+hikes <- hikes_gross %>%
+  select(-c(`_id`, bounds, gpx, url, name, user)) %>% 
+  mutate(start_time = as_datetime(start_time),
+         end_time = as_datetime(end_time),
+         difficulty = substr(difficulty, 1, 3))
+
+# remove empty spaces in diffulty strings and convert to ordered factor
+hikes$difficulty <- gsub(" ", "", hikes$difficulty) %>% factor(levels = hike_difficulty_levels, ordered = TRUE)
+```
+
+We also dropped columns that are not relevant for the analysis. These are the `X_id`, `bounds`, `gpx`, `url`, `name`, and `user` columns.
+
+We can now proceed with the missing values management.
+
+### Missing values
+
+```{r, echo=FALSE}
+naniar::vis_miss(hikes)
+```
+
+Using the `naniar` package, we can visualize the missing values in the dataset. We see that the `min_elevation`, `max_elevation`, `start_time`, and `end_time` variables have missing values. Since these missing values represent more than 5% of the observations of each concerned column, we will not remove them. Instead, we will impute them with the most appropriate value of the respective column given its distribution skewness.
+
+```{r, echo=FALSE}
+summary(hikes$min_elevation)
+```
+
+We can see in the hereabove summary that the `min_elevation` variable contains unrealistic negative values. We will impose missing values for these observations. Since negative elevations are possible, we arbitrarily take as a threshold the value of -500m corresponding to the approximate elevation of the [Dead Sea](https://en.wikipedia.org/wiki/Dead_Sea). We will then impute the missing values with the median of the column.
+
+```{r, include=FALSE}
+hikes <- hikes %>%
+  mutate(min_elevation = ifelse(min_elevation < -500, NA, min_elevation)) %>%
+  mutate(min_elevation = ifelse(is.na(min_elevation), median(min_elevation, na.rm = TRUE), min_elevation))
+
+summary(hikes$min_elevation)
+```
+```{r, echo=FALSE}
+summary(hikes$max_elevation)
+```
+
+Since there is no unrealistic value to manage in the `max_elevation` variable, we will directly impute the missing values with the median of the column.
+
+```{r, include=FALSE}
+hikes <- hikes %>%
+  mutate(max_elevation = ifelse(is.na(max_elevation), median(max_elevation, na.rm = TRUE), max_elevation))
+```
+
+For the missing values in the time variables, we will create a new column for the total duration of the hike in seconds, to coincide with the unit of the `moving_time` column, then separate the year, month and hour components of the `start_time` and `end_time` variables, and impute the missing values with the median of the respective columns, rounded to the closest integer. The start and end time columns will be removed from the dataset.
+
+```{r, include=FALSE}
+hikes <- hikes %>%
+  mutate(total_duration = as.numeric(difftime(end_time, start_time, units = "secs")),
+         start_year = year(start_time),
+         start_month = month(start_time),
+         start_hour = hour(start_time),
+         end_year = year(end_time),
+         end_month = month(end_time),
+         end_hour = hour(end_time)) %>% 
+
+  mutate(
+    total_duration = ifelse(is.na(total_duration), round(median(total_duration, na.rm = TRUE)), total_duration),
+    start_year = ifelse(is.na(start_year), round(median(start_year, na.rm = TRUE)), start_year),
+    start_month = ifelse(is.na(start_month), round(median(start_month, na.rm = TRUE)), start_month),
+    start_hour = ifelse(is.na(start_hour), round(median(start_hour, na.rm = TRUE)), start_hour),
+    end_year = ifelse(is.na(end_year), round(median(end_year, na.rm = TRUE)), end_year),
+    end_month = ifelse(is.na(end_month), round(median(end_month, na.rm = TRUE)), end_month),
+    end_hour = ifelse(is.na(end_hour), round(median(end_hour, na.rm = TRUE)), end_hour)) %>%
+
+  select(-c(start_time, end_time))
+
+naniar::vis_miss(hikes)
+```
+
+### Unrealistic values and outliers
+
+We have successfully imputed all missing values in the dataset. But some observations still contain unrealistic values. We will first check the distributions of the quantitative variables to identify outliers. We do not visualize the distributions of `max_elevation` and `min_elevation` as we already checked for unrealistic values.
+
+```{r, echo=FALSE}
+#disabling the scientific notation
+options(scipen = 999)
+
+theme_set(theme_bw())
+
+#visualizing the distributions of the quantitative variables, x labels rotated by 45 degrees
+hikes %>% select(-c(difficulty, start_month, start_hour, end_month, end_hour, min_elevation, max_elevation)) %>% 
+  gather(key = "variable", value = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of quantitative variables")
+```
+Visualizing the distributions of the quantitative variables, we see that all are cramped on a side of the plot, suggesting the presence of extreme outliers.
+
+#### In `uphill` and `downhill`
+
+We will use a scatterplot to visualize the relationship between the `uphill` and `downhill` variables.
+
+```{r, echo=FALSE}
+ggplot(hikes, aes(uphill, downhill)) +
+  geom_point() +
+  labs(title = "Uphill ~ Downhill",
+       x = "Elevation gain (m)",
+       y = "Elevation loss (m)")
+```
+We can identify unrealistic values in the `uphill` and `downhill` variables. We see that the highest values are over 50,000 meters for the `downhill` variable, and over 30,000 meters for the `uphill` variable. We will remove observations with `uphill` over 10,000 meters, as this threshold removes 14 hikes, accounting for 0.1% of the dataset.
+
+```{r, include=FALSE}
+#share of observations above 10000 in uphill
+sum(hikes$uphill > 10000) / nrow(hikes)
+
+#drop observations with uphill above 10000
+hikes <- hikes %>% filter(uphill <= 10000)
+```
+#### In time variables
+
+Some hikes have start and end year in the year 0, or 1970, which is unrealistic for the first, and the start of the unix time for the latter. Twenty-eight hikes have a `start_year` or `end_year` below 2000. Using the `table()` function, we can see that among those, 27 start and end years are 1970, and one starts in the year 0 but ends in 2015. 
+
+Because of this date issue, we can see that some other variables are impacted: `total_duration`, `moving_time`, and `max_speed`. We will not drop them since all other variables contain realistic values, and not like the `uphill` and `downhill` variables, these other values are not related to the time variables. We will thus impose missing values the variables stated above, for observations with a `start_date` below 2000, and then impute them with the column median.
+
+```{r, include=FALSE}
+#number of observations with start_year or end_year below 2000
+sum(hikes$start_year < 2000 | hikes$end_year < 2000)
+
+#number of observations with start_year or end_year below 2000 and their distribution
+hikes %>% filter(start_year < 2000 | end_year < 2000) %>% select(start_year, end_year) %>% table()
+
+#visual inspection of the hikes with start_year or end_year below 2000
+hikes %>% filter(start_year < 2000)
+
+#impose NA and impute missing values
+hikes <- hikes %>% 
+  mutate(
+    moving_time = ifelse(start_year < 2000, NA, moving_time),
+    max_speed = ifelse(start_year < 2000, NA, max_speed),
+    total_duration = ifelse(start_year < 2000, NA, total_duration),
+    start_year = ifelse(start_year < 2000, NA, start_year),
+    start_month = ifelse(start_year < 2000, NA, start_month),
+    start_hour = ifelse(start_year < 2000, NA, start_hour),
+    end_year = ifelse(end_year < 2000, NA, end_year),
+    end_month = ifelse(end_year < 2000, NA, end_month),
+    end_hour = ifelse(end_year < 2000, NA, end_hour)) %>%
+  
+  mutate(
+    moving_time = ifelse(is.na(moving_time), median(moving_time, na.rm = TRUE), moving_time),
+    max_speed = ifelse(is.na(max_speed), median(max_speed, na.rm = TRUE), max_speed),
+    total_duration = ifelse(is.na(total_duration), median(total_duration, na.rm = TRUE), total_duration),
+    start_year = ifelse(is.na(start_year), median(start_year, na.rm = TRUE), start_year),
+    start_month = ifelse(is.na(start_month), median(start_month, na.rm = TRUE), start_month),
+    start_hour = ifelse(is.na(start_hour), median(start_hour, na.rm = TRUE), start_hour),
+    end_year = ifelse(is.na(end_year), median(end_year, na.rm = TRUE), end_year),
+    end_month = ifelse(is.na(end_month), median(end_month, na.rm = TRUE), end_month),
+    end_hour = ifelse(is.na(end_hour), median(end_hour, na.rm = TRUE), end_hour))
+```
+
+#### In `length_3d` and `length_2d`
+
+Using the `summary()` function, we see that the `length_3d` and `length_2d` variables have the exact same summary statistics, with the highest value being over 30,000 km.
+
+```{r, include=FALSE}
+hikes$length_3d %>% summary()
+hikes$length_2d %>% summary()
+```
+
+
+```{r, echo=FALSE}
+hikes2 <- hikes %>% filter(length_3d < 30000000)
+
+ggplot(hikes2, aes(length_3d, length_2d)) +
+  geom_point() +
+  labs(title = "Length 3D ~ Length 2D",
+       x = "Length 3D (km)",
+       y = "Length 2D (km)") +
+  geom_abline(intercept = 0, slope = 1)
+
+rm(hikes2)
+```
+Plotting the `length_3d` against the `length_2d` variable, we see that the two variables are equal, perfectly following the x=y line. We will thus remove the `length_2d` variable and rename the `length_3d` variable to `length`. We will also drop the observations with a length above 100 km, which corresponds to 29 hikes. Removing these extra 29 observations would result in a total data loss from the original dataset of 0.35%, we will then do it.
+
+```{r, include=FALSE}
+hikes <- hikes %>% select(-length_2d) %>% rename(length = length_3d)
+
+1 - ((nrow(hikes) - sum(hikes$length > 100000)) / nrow(hikes_gross))
+
+hikes <- hikes %>% filter(length <= 100000)
+```
+
+#### In `max_speed`
+
+The `max_speed` variable contains unrealistic values, with the highest value being over 190 km/h. We will remove observations where the `max_speed` is above 25 km/h, which corresponds to 41 hikes, which brings the total amount of data loss to 0.7% of the original dataset. We acknowledge that 25 km/h is a high threshold for hiking, but we will use it to remove the most extreme outliers, and still account for some trail runners. Since the variable represents the maximum reached speed and not the average speed, a fast trail runner downhill could reach this level of speed.
+
+```{r, include=FALSE}
+sum(hikes$max_speed > 15)
+
+1 - ((nrow(hikes) - sum(hikes$max_speed > 25)) / nrow(hikes_gross))
+
+hikes <- hikes %>% filter(max_speed <= 25)
+```
+#### In `total_duration` and `moving_time`
+
+We first notice that there is 98 observations with impossible values. That is if an observation complies with at least one of the following conditions: 
+
++ `total_duration` < `moving_time`,
++ `total_duration` < 0,
++ `moving_time` < 0. 
+
+Since the other variables do not seem to be impacted by these unrealistic values, we will proceed as with unrealistic date values, by imposing missing values for observations with `total_duration` or `moving_time` below 0, and then impute them with the median of the respective columns.
+
+The remaining observations with `total_duration` < `moving_time` will be dropped. We now have a 0.9% data loss from the original dataset.
+
+
+```{r, include=FALSE}
+sum(hikes$total_duration < hikes$moving_time | hikes$total_duration < 0 | hikes$moving_time < 0)
+
+hikes <- hikes %>% 
+  mutate(
+    total_duration = ifelse(total_duration < 0 | moving_time < 0, NA, total_duration),
+    moving_time = ifelse(total_duration < 0 | moving_time < 0, NA, moving_time)
+  ) %>%
+  
+  mutate(
+    total_duration = ifelse(is.na(total_duration), median(total_duration, na.rm = TRUE), total_duration),
+    moving_time = ifelse(is.na(moving_time), median(moving_time, na.rm = TRUE), moving_time)
+  )
+
+sum(hikes$total_duration < hikes$moving_time)
+
+hikes <- hikes %>% filter(total_duration >= moving_time)
+```
+
+We still have some extreme outliers in the `total_duration` variable, with the highest being over 78 years long. We will remove observations with a `total_duration` above 1.5 times the interquartile range above the third quartile, which corresponds to 321 hikes, resulting in a total data loss of 3.6% of the original dataset.
+
+```{r, include=FALSE}
+ggplot(hikes, aes(total_duration, length)) +
+  geom_point() +
+  labs(title = "Total duration ~ Length",
+       x = "Total duration (s)",
+       y = "Length (m)")
+
+Q1 <- quantile(hikes$total_duration, 0.25)
+Q3 <- quantile(hikes$total_duration, 0.75)
+IQR <- Q3 - Q1
+
+sum(hikes$total_duration > Q3 + 1.5 * IQR)
+
+hikes <- hikes %>% filter(total_duration <= Q3 + 1.5 * IQR)
+
+1 - ((nrow(hikes) - sum(hikes$total_duration > Q3 + 1.5 * IQR)) / nrow(hikes_gross))
+
+rm(Q1, Q3, IQR)
+```
+
+### Feature engineering
+
+We will create a new variable `speed` representing the average speed of the hike in km/h, by dividing the `length` variable by the `total_duration` variable, then multiplying by 3.6 to convert the speed from m/s to km/h. If `total_duration` is 0, we will force a missing values, and then impute it with the median of the column.
+
+```{r, include=FALSE}
+hikes <- hikes %>% 
+  mutate(speed = length / total_duration * 3.6) %>%
+  mutate(speed = ifelse(total_duration == 0, NA, speed)) %>%
+  mutate(speed = ifelse(is.na(speed), median(speed, na.rm = TRUE), speed))
+```
+
+
+# Exploratory Data Analysis
+
+After these data cleaning steps, we can now proceed with the exploratory data analysis. We will start by visualizing the density of the quantitative variables.
+
+```{r, echo=FALSE}
+hikes %>% select(-c(difficulty, start_month, start_hour, end_month, end_hour, end_year, start_year)) %>% 
+  gather(key = "variable", value = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_density() +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Density of quantitative variables")
+```
+
+We can see that the variables are either right-skewed or similar to a normal distribution. We often have a peak in the density plot at the median, due to the imputation of missing values with the median of the column.
+
+```{r, echo=FALSE}
+gridExtra::grid.arrange(
+  hikes %>% select(difficulty) %>% 
+    ggplot(aes(x = difficulty)) +
+    geom_bar() +
+    labs(title = "Distribution of difficulty"),
+  
+  hikes %>% select(difficulty, length) %>% 
+    ggplot(aes(x = difficulty, y = length)) +
+    geom_boxplot() +
+    labs(title = "Length by difficulty"),
+  
+  hikes %>% select(difficulty, uphill) %>%
+    ggplot(aes(x = difficulty, y = uphill)) +
+    geom_boxplot() +
+    labs(title = "Elevation gain by difficulty"),
+  
+  hikes %>% select(difficulty, downhill) %>%
+    ggplot(aes(x = difficulty, y = downhill)) +
+    geom_boxplot() +
+    labs(title = "Elevation loss by difficulty"),
+  
+  ncol = 2
+)
+```
+
+We can see that most of the hikes are rated T2 or T3. We have an increasingly lower number of hikes as the difficulty increases, with the most difficult hikes being the least represented in the dataset.
+
+Surprisingly, we don't see a clear relationship between the hike's difficulty and its length. We can see that the hikes rated T6 have a higher median length than the hikes rated T5, but the hikes rated T4 have a lower median length than the hikes rated T3. This suggests that the difficulty rating is not solely based on the hike's length.
+
+The same observation can be made for the elevation gain and loss. We see that the hikes rated T6 have a lower median elevation gain and loss than the hikes rated T5. This suggests that the difficulty rating is not solely based on the hike's elevation gain and loss.
+
+
+```{r, echo=FALSE}
+ggplot(hikes, aes(length, speed)) +
+  geom_point(aes(color = difficulty)) +
+  labs(title = "Speed ~ Length",
+       x = "Length (m)",
+       y = "Speed (km/h)")
+```
+
+Visualizing the speed against the length of the hike, we see a relashionship between the two variables.
+
+But we can also identify outliers in the `speed` variable. We will remove observations with a `speed` above 15 km/h, which corresponds to 26 hikes, resulting in a total data loss of 3.8% of the original dataset.
+
+```{r, include=FALSE}
+sum(hikes$speed > 15)
+
+hikes <- hikes %>% filter(speed <= 15)
+
+(nrow(hikes) - nrow(hikes_gross)) / nrow(hikes_gross)
+```
+
+
+# Methodology
+
+We will now proceed with the predictive analysis of the hikes' duration and difficulty. We will start by splitting the dataset into a training and a testing set, with 70% of the observations in the training set, and 30% in the testing set.
+
+Then, we will run `regsubsets()` to select the most relevant variables using the forward method for a regression analysis of the `total_duration` variable based on the other variables in the dataset. We will then perform a 200 folds cross-validation to select the best model, and evaluate its performance on the testing set using the RMSE. 
+We will start with only the following variables, that are the only ones that are known before the hike occurs: `length`, `uphill`, `downhill`, `difficulty`, `min_elevation`, `max_elevation`, `start_year`, `start_month`, `start_hour`.
+
+For the classification analysis of the hikes' difficulty, we will create a new variable `is_diffucult` that will be a binary variable, with 0 for hikes rated T1 to T3 included, and 1 for hikes rated above T3. The T3 threshold was chosen as it was the best one to cut the dataset in two equal parts. We will then run a logistic regression analysis of the `is_difficult` variable based on the other variables in the dataset, excluding `difficulty`, and evaluate the model's performance on the testing set using the accuracy metric.
+
+Then, we will perform a clustering analysis of the hikes' season based on the `speed` and `max_elevation` variables. We will use the k-means algorithm to cluster the hikes into two clusters - summer or not summer (winter) - based on these variables and visualize the clusters. We define summer hikes as hikes starting in May, June, July, August, or September, and winter hikes as hikes starting in the other months.
+
+# Modelling and results
+
+## Predictive analysis of the hikes' duration
+
+```{r, include=FALSE}
+library(caret)
+library(leaps)
+library(glmnet)
+
+set.seed(123)
+
+#splitting the dataset
+train_index <- createDataPartition(hikes$total_duration, p = 0.7, list = FALSE)
+hikes_reg <- hikes %>% select(length, uphill, downhill, difficulty, min_elevation, max_elevation, start_year, start_month, start_hour, total_duration)
+train_set <- hikes_reg[train_index, ]
+test_set <- hikes_reg[-train_index, ]
+
+#running regsubsets
+regsubsets_model <- regsubsets(total_duration ~ ., data = train_set, nvmax = ncol(train_set) - 1, method = "forward")
+
+# Create model matrices
+x_train <- model.matrix(total_duration ~ . -1, data = train_set)
+y_train <- train_set$total_duration
+
+x_test <- model.matrix(total_duration ~ . -1, data = test_set)
+y_test <- test_set$total_duration
+
+# Run cross-validation
+cv_model <- cv.glmnet(x_train, y_train, alpha = 0.5, nfolds = 200)
+
+# Fit best model
+best_model <- glmnet(x_train, y_train, alpha = 0.5, lambda = cv_model$lambda.min)
+
+# Predict on test set
+test_set$predicted_duration <- predict(best_model, newx = x_test)
+
+# Evaluate RMSE
+RMSE <- sqrt(mean((y_test - test_set$predicted_duration)^2))
+```
+
+The best model has a root mean squared error of `r round(RMSE, 2)`, which means that the predicted duration of the hikes is on average `r round(RMSE/60, 2)` minutes away from the actual duration, with a median of the variable of `r round(median(test_set$total_duration)/60, 2)` minutes.
+
+```{r, echo=FALSE}
+ggplot(test_set, aes(y = total_duration/60, x = predicted_duration/60)) +
+  geom_jitter(alpha=0.5) +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(title = "Actual duration ~ Predicted duration",
+       x = "Predicted duration (min)",
+       y = "Actual duration (min)")
+```
+
+This plot shows that the predicted duration of the hikes is relatively close to the actual duration, with an overall linear relationship between the two variables following the x=y line.
+
+## Classification analysis of the hikes' difficulty
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+hikes_class <- hikes %>% 
+  mutate(is_difficult = ifelse(difficulty <= "T3", 0, 1)) %>% 
+  select(-difficulty)
+
+set.seed(123)
+train_index <- createDataPartition(hikes_class$is_difficult, p = 0.7, list = FALSE)
+train_set <- hikes_class[train_index, ]
+test_set <- hikes_class[-train_index, ]
+
+#running the logistic regression
+logistic_model <- glm(is_difficult ~ ., data = train_set, family = "binomial")
+
+#predicting the difficulty
+test_set$predicted_difficulty <- predict(logistic_model, newdata = test_set, type = "response")
+
+#evaluating the model
+accuracy <- mean(ifelse(test_set$predicted_difficulty > 0.5, 1, 0) == test_set$is_difficult)
+
+#plot the ROC curve
+library(pROC)
+roc_curve <- roc(test_set$is_difficult, test_set$predicted_difficulty)
+
+roc_data <- data.frame(
+  sensitivity = roc_curve$sensitivities,
+  specificity = roc_curve$specificities
+)
+
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  labs(title = "ROC curve",
+       x = "False positive rate",
+       y = "True positive rate")
+```
+
+The logistic regression model has an accuracy of `r round(accuracy, 2)`, which means that the model correctly predicts the difficulty of the hikes in the testing set in `r round(accuracy * 100, 2)`% of the cases. Given that the dataset is fairly balanced, with 65% of the hikes rated T1 to T3, and 35% rated above T3, this accuracy is quite good.
+
+The ROC curve shows that the model has a good trade-off between sensitivity and specificity, with a high true positive rate and a low false positive rate. This performance is far from perfect but is still acceptable.
+
+## Clustering analysis of the hikes' season
+
+```{r, echo=FALSE}
+#creating the season variable
+hikes_cluster <- hikes %>% 
+  mutate(season = ifelse(start_month %in% c(5, 6, 7, 8, 9), "summer", "winter")) %>% 
+  select(season, speed, max_elevation)
+
+#running the k-means algorithm
+set.seed(123)
+kmeans_model <- kmeans(hikes_cluster %>% select(speed, max_elevation), centers = 2)
+
+#visualizing the clusters
+ggplot(hikes_cluster, aes(speed, max_elevation, color = season)) +
+  geom_jitter(alpha=0.5) +
+  geom_point(data = as.data.frame(kmeans_model$centers), aes(x = speed, y = max_elevation), color = "black", size = 3) +
+  labs(title = "Clusters of hikes by season, with centers as black dots",
+       x = "Speed (km/h)",
+       y = "Max elevation (m)")
+```
+
+The k-means algorithm identified two clusters of hikes based on the speed and maximum elevation of the hikes. The black dots represent the centers of the clusters. We can see that the algorithm successfully separated the hikes into two clusters based on the season, with the summer hikes having a lower speed and higher maximum elevation than the winter hikes.
+
+# Limitations
+
+This analysis has several limitations:
+
+The dataset contains missing and unrealistic values that were imputed or removed, which could have impacted the results of the analysis. This median imputation is well visible on most plots.
+
+This analysis is based on a dataset that is not up-to-date, being scrapped in 2018, and may not be representative of current hikes.
+
+Hikr.org is a platform where users can post reports about their hikes, and thus are likely to be more advanced hikers, or at least passionate ones, making the dataset likely biased and not representative of all hikes in the world.
+
+# References
+
+- R Core Team (2023). *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing, Vienna, Austria. URL <https://www.R-project.org/>.
+
+- Wickham, H., François, R., Henry, L., & Müller, K. (2023). *dplyr: A Grammar of Data Manipulation*. R package version 1.1.0. <https://CRAN.R-project.org/package=dplyr>.
+
+- Wickham, H. (2016). *ggplot2: Elegant Graphics for Data Analysis*. Springer-Verlag New York. ISBN 978-3-319-24277-4. URL <https://ggplot2.tidyverse.org>.
+
+- Tierney, N., Cook, D., & Prvan, T. (2023). *naniar: Data Structures, Summaries, and Visualisations for Missing Data*. R package version 0.6.1. <https://CRAN.R-project.org/package=naniar>.
+
+- Kuhn, M. (2023). *caret: Classification and Regression Training*. R package version 6.0-93. <https://CRAN.R-project.org/package=caret>.
+
+- Lumley, T. (2023). *leaps: Regression Subset Selection*. R package version 3.1. <https://CRAN.R-project.org/package=leaps>.
+
+- Friedman, J., Hastie, T., & Tibshirani, R. (2010). Regularization Paths for Generalized Linear Models via Coordinate Descent. *Journal of Statistical Software*, 33(1), 1-22. URL <https://www.jstatsoft.org/v33/i01/>.
+
+- Robin, X., Turck, N., Hainard, A., Tiberti, N., Lisacek, F., Sanchez, J.-C., & Müller, M. (2011). pROC: An open-source package for R and S+ to analyze and compare ROC curves. *BMC Bioinformatics*, 12, 77. <https://doi.org/10.1186/1471-2105-12-77>.
+
+- Rocco. (2018). *GPS recorded hikes from hikr.org*. Kaggle. <https://www.kaggle.com/datasets/roccoli/gpx-hike-tracks> (License: CC0)
